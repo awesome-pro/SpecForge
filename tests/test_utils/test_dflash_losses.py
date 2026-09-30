@@ -970,16 +970,56 @@ class TestDFlashLosses(unittest.TestCase):
         self.assertEqual(batch_anchors[0][batch_keep[0]].tolist(), [2])
         self.assertFalse(batch_keep[2].any())
 
-    def test_shared_sampler_rejects_a_batch_without_adjacent_targets(self):
+    def test_shared_sampler_degrades_a_batch_without_adjacent_targets(self):
+        # Raising here would exit before the loss-denominator all-reduce and
+        # hang peer ranks until the NCCL timeout, so a batch with no adjacent
+        # supervised pair must yield a fully masked batch that still reaches
+        # the collective.
         model = _anchor_sampler_subject()
         loss_mask = torch.tensor([[1.0, 0.0, 1.0]])
-        with self.assertRaisesRegex(ValueError, "two consecutive"):
-            OnlineDFlashModel._sample_anchor_positions(
-                model,
-                seq_len=loss_mask.shape[1],
-                loss_mask=loss_mask,
-                device=loss_mask.device,
-            )
+        anchors, keep = OnlineDFlashModel._sample_anchor_positions(
+            model,
+            seq_len=loss_mask.shape[1],
+            loss_mask=loss_mask,
+            device=loss_mask.device,
+        )
+
+        self.assertEqual(anchors.shape, (1, 1))
+        self.assertEqual(keep.shape, (1, 1))
+        self.assertEqual(anchors.dtype, torch.long)
+        self.assertEqual(keep.dtype, torch.bool)
+        self.assertFalse(bool(keep.any()))
+
+    def test_shared_sampler_degrades_when_every_token_is_masked(self):
+        model = _anchor_sampler_subject()
+        loss_mask = torch.zeros(3, 16)
+        anchors, keep = OnlineDFlashModel._sample_anchor_positions(
+            model,
+            seq_len=16,
+            loss_mask=loss_mask,
+            device=loss_mask.device,
+        )
+
+        self.assertEqual(anchors.shape, (3, 1))
+        self.assertEqual(keep.shape, (3, 1))
+        self.assertFalse(bool(keep.any()))
+
+    def test_dspark_sampler_degrades_without_adjacent_supervised_pair(self):
+        # Supervised tokens exist but are isolated, so no anchor has its first
+        # target supervised: the shape left behind when non-finite
+        # sanitization zeroes parts of the loss mask.
+        model = _make_dspark_model(self.logits, self.anchors, self.keep_mask)
+        loss_mask = torch.zeros(2, 16)
+        loss_mask[:, ::2] = 1.0
+        anchors, keep = OnlineDSparkModel._sample_anchor_positions(
+            model,
+            seq_len=16,
+            loss_mask=loss_mask,
+            device=loss_mask.device,
+        )
+
+        self.assertEqual(anchors.shape, keep.shape)
+        self.assertFalse(bool(keep.any()))
 
 
 if __name__ == "__main__":

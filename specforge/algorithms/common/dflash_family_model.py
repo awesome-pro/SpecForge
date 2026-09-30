@@ -1,6 +1,7 @@
 # coding=utf-8
 """DFlash-family training models and shared masking helpers."""
 
+import logging
 import os
 from functools import partial
 from typing import Dict, NamedTuple, Optional, Tuple
@@ -13,6 +14,8 @@ from specforge.algorithms.common.dflash_metrics import hard_label_prefix_counts
 from specforge.core.chunking import checkpointed_chunk_reduce
 from specforge.modeling.draft.dflash import DFlashDraftModel
 from specforge.modeling.draft.flex_attention_backend import flex_attention_backend
+
+logger = logging.getLogger(__name__)
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -463,9 +466,19 @@ class OnlineDFlashModel(nn.Module):
             max_valid_anchors = int(valid_counts.max().item())
         width = min(self.num_anchors, max(0, int(max_valid_anchors)))
         if width == 0:
-            raise ValueError(
-                "DFlash-family training requires two consecutive supervised tokens"
+            # Raising here would skip this rank past the all-reduce of the loss
+            # denominator and hang every peer until the NCCL timeout. Degrade
+            # to a fully masked micro-batch instead: this rank contributes no
+            # supervision but still reaches the collective.
+            logger.warning(
+                "%s: no valid anchor positions in this micro-batch; "
+                "contributing zero supervision for this step.",
+                type(self).__name__,
             )
+            bsz = loss_mask.shape[0]
+            anchors = torch.zeros((bsz, 1), dtype=torch.long, device=device)
+            keep_mask = torch.zeros((bsz, 1), dtype=torch.bool, device=device)
+            return anchors, keep_mask
 
         random_values = torch.rand(valid.shape, device=device)
         random_values.masked_fill_(~valid, 2.0)
